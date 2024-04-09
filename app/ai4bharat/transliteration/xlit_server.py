@@ -154,7 +154,6 @@ def reverse_xlit_api(lang_code, word):
     return jsonify(response)
 
 @app.route('/transliterate', methods=['POST'])
-@limiter.limit("5/second")
 def ulca_api():
     '''
     ULCA-compliant endpoint. See for sample request-response:
