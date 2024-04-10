@@ -22,6 +22,9 @@ from uuid import uuid4
 from datetime import datetime
 import traceback
 import enum
+import os
+import redis
+import json
 
 from .utils import (
     LANG_CODE_TO_DISPLAY_NAME,
@@ -207,6 +210,14 @@ def reverse_xlit_api(lang_code, word):
     return jsonify(response)
 
 
+r = redis.Redis(
+    host=os.getenv("REDIS_HOST"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    password=os.getenv("REDIS_PASSWORD", None),
+    ssl=True,
+)
+
+
 @app.route("/transliterate", methods=["POST"])
 def ulca_api():
     """
@@ -272,15 +283,28 @@ def ulca_api():
         lang_code = data["config"]["language"]["targetLanguage"]
 
     for item in data["input"]:
-        if is_sentence:
+        # Check if the transliteration is in the cache
+        key = json.dumps(
+            [
+                item["source"],
+                data["config"]["language"]["sourceLanguage"],
+                data["config"]["language"]["targetLanguage"],
+            ]
+        )
+        value = r.get(key)
+        if value is not None:
+            item["target"] = [value.decode("utf-8")]
+        elif is_sentence:
             item["target"] = [
                 engine.translit_sentence(item["source"], lang_code=lang_code)
             ]
+            r.set(key, item["target"][0].encode("utf-8"))
         else:
             item["source"] = item["source"][:32]
             item["target"] = engine.translit_word(
                 item["source"], lang_code=lang_code, topk=num_suggestions
             )
+            r.set(key, item["target"][0].encode("utf-8"))
 
     return {
         "output": data["input"],
