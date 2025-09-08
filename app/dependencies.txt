@@ -1,3 +1,4 @@
+torch<2.6
 pydload
 flask
 flask_cors
