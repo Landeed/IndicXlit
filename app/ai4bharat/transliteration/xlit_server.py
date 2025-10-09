@@ -313,3 +313,87 @@ def ulca_api():
         #     "message" : "success"
         # }
     }, 200
+
+
+@app.route("/transliterate2", methods=["POST"])
+def ulca_api2():
+    """
+    ULCA-compliant endpoint. See for sample request-response:
+    https://github.com/ULCA-IN/ulca/tree/master/specs/examples/model/transliteration-model
+    """
+    data = request.get_json(force=True)
+
+    if "input" not in data or "config" not in data:
+        return (
+            jsonify(
+                {
+                    "status": {
+                        "statusCode": 400,
+                        "message": "Ensure `input` and `config` fields missing.",
+                    }
+                }
+            ),
+            400,
+        )
+
+    if (
+        data["config"]["language"]["sourceLanguage"] == "en"
+        and data["config"]["language"]["targetLanguage"]
+        in ENGINE["en2indic"].all_supported_langs
+    ) or (
+        data["config"]["language"]["sourceLanguage"]
+        in ENGINE["indic2en"].all_supported_langs
+        and data["config"]["language"]["targetLanguage"] == "en"
+    ):
+        pass
+    else:
+        return (
+            jsonify(
+                {
+                    "status": {
+                        "statusCode": 501,
+                        "message": "The mentioned language-pair is not supported yet.",
+                    }
+                }
+            ),
+            501,
+        )
+
+    is_sentence = (
+        data["config"]["isSentence"] if "isSentence" in data["config"] else False
+    )
+    num_suggestions = (
+        1
+        if is_sentence
+        else (
+            data["config"]["numSuggestions"]
+            if "numSuggestions" in data["config"]
+            else 5
+        )
+    )
+
+    if data["config"]["language"]["targetLanguage"] == "en":
+        engine = ENGINE["indic2en"]
+        lang_code = data["config"]["language"]["sourceLanguage"]
+    else:
+        engine = ENGINE["en2indic"]
+        lang_code = data["config"]["language"]["targetLanguage"]
+
+    for item in data["input"]:
+        if is_sentence:
+            item["target"] = [
+                engine.translit_sentence(item["source"], lang_code=lang_code)
+            ]
+        else:
+            item["source"] = item["source"][:32]
+            item["target"] = engine.translit_word(
+                item["source"], lang_code=lang_code, topk=num_suggestions
+            )
+
+    return {
+        "output": data["input"],
+        # "status": {
+        #     "statusCode": 200,
+        #     "message" : "success"
+        # }
+    }, 200
