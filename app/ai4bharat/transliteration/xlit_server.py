@@ -315,85 +315,145 @@ def ulca_api():
     }, 200
 
 
+from contextlib import contextmanager
+from threading import Semaphore
+from flask import abort
+import logging
+import psutil
+
+logger = logging.getLogger(__name__)
+
+MAX_INFER_SLOTS = 5
+infer_slots = Semaphore(MAX_INFER_SLOTS)
+sync_slot = Semaphore(1)
+
+
+@contextmanager
+def try_acquire():
+    uuid = uuid4()
+    if not infer_slots.acquire(blocking=False):
+        # fail *fast* without work
+        abort(429, description="Busy")
+        logger.warning("Discarding extra request")
+    try:
+        logger.warning(
+            "%s acquired inference slot %d/%d, load %s",
+            uuid,
+            MAX_INFER_SLOTS - infer_slots._value,
+            MAX_INFER_SLOTS,
+            psutil.cpu_percent(interval=0),
+        )
+        yield
+    finally:
+        logger.warning("%s released inference slot", uuid)
+        infer_slots.release()
+
+
 @app.route("/transliterate2", methods=["POST"])
 def ulca_api2():
     """
     ULCA-compliant endpoint. See for sample request-response:
     https://github.com/ULCA-IN/ulca/tree/master/specs/examples/model/transliteration-model
     """
-    data = request.get_json(force=True)
+    uuid = uuid4()
+    if not infer_slots.acquire(blocking=False):
+        # fail *fast* without work
+        logger.warning("Discarding extra request")
+        abort(429, description="Busy")
+    try:
+        data = request.get_json(force=True)
 
-    if "input" not in data or "config" not in data:
-        return (
-            jsonify(
-                {
-                    "status": {
-                        "statusCode": 400,
-                        "message": "Ensure `input` and `config` fields missing.",
+        logger.warning(
+            "%s acquired inference slot %d/%d, load %s, request %s",
+            uuid,
+            MAX_INFER_SLOTS - infer_slots._value,
+            MAX_INFER_SLOTS,
+            psutil.cpu_percent(interval=0),
+            json.dumps(data, ensure_ascii=False),
+        )
+
+        if "input" not in data or "config" not in data:
+            return (
+                jsonify(
+                    {
+                        "status": {
+                            "statusCode": 400,
+                            "message": "Ensure `input` and `config` fields missing.",
+                        }
                     }
-                }
-            ),
-            400,
-        )
-
-    if (
-        data["config"]["language"]["sourceLanguage"] == "en"
-        and data["config"]["language"]["targetLanguage"]
-        in ENGINE["en2indic"].all_supported_langs
-    ) or (
-        data["config"]["language"]["sourceLanguage"]
-        in ENGINE["indic2en"].all_supported_langs
-        and data["config"]["language"]["targetLanguage"] == "en"
-    ):
-        pass
-    else:
-        return (
-            jsonify(
-                {
-                    "status": {
-                        "statusCode": 501,
-                        "message": "The mentioned language-pair is not supported yet.",
-                    }
-                }
-            ),
-            501,
-        )
-
-    is_sentence = (
-        data["config"]["isSentence"] if "isSentence" in data["config"] else False
-    )
-    num_suggestions = (
-        1
-        if is_sentence
-        else (
-            data["config"]["numSuggestions"]
-            if "numSuggestions" in data["config"]
-            else 5
-        )
-    )
-
-    if data["config"]["language"]["targetLanguage"] == "en":
-        engine = ENGINE["indic2en"]
-        lang_code = data["config"]["language"]["sourceLanguage"]
-    else:
-        engine = ENGINE["en2indic"]
-        lang_code = data["config"]["language"]["targetLanguage"]
-
-    for item in data["input"]:
-        if is_sentence:
-            item["target"] = [
-                engine.translit_sentence(item["source"], lang_code=lang_code)
-            ]
-        else:
-            item["source"] = item["source"][:32]
-            item["target"] = engine.translit_word(
-                item["source"], lang_code=lang_code, topk=num_suggestions
+                ),
+                400,
             )
 
-    return {
-        "output": data["input"],
-        # "status": {
-        #     "statusCode": 200,
-        #     "message" : "success"
-        # }
-    }, 200
+        if (
+            data["config"]["language"]["sourceLanguage"] == "en"
+            and data["config"]["language"]["targetLanguage"]
+            in ENGINE["en2indic"].all_supported_langs
+        ) or (
+            data["config"]["language"]["sourceLanguage"]
+            in ENGINE["indic2en"].all_supported_langs
+            and data["config"]["language"]["targetLanguage"] == "en"
+        ):
+            pass
+        else:
+            return (
+                jsonify(
+                    {
+                        "status": {
+                            "statusCode": 501,
+                            "message": "The mentioned language-pair is not supported yet.",
+                        }
+                    }
+                ),
+                501,
+            )
+
+        is_sentence = (
+            data["config"]["isSentence"] if "isSentence" in data["config"] else False
+        )
+        num_suggestions = (
+            1
+            if is_sentence
+            else (
+                data["config"]["numSuggestions"]
+                if "numSuggestions" in data["config"]
+                else 5
+            )
+        )
+
+        if data["config"]["language"]["targetLanguage"] == "en":
+            engine = ENGINE["indic2en"]
+            lang_code = data["config"]["language"]["sourceLanguage"]
+        else:
+            engine = ENGINE["en2indic"]
+            lang_code = data["config"]["language"]["targetLanguage"]
+
+        for item in data["input"]:
+            if not sync_slot.acquire(blocking=True, timeout=10):
+                # fail *fast* without work
+                logger.warning("Discarding %s mid-request", uuid)
+                abort(429, description="Busy")
+            try:
+                if is_sentence:
+                    item["target"] = [
+                        engine.translit_sentence(item["source"], lang_code=lang_code)
+                    ]
+                else:
+                    item["source"] = item["source"][:32]
+                    item["target"] = engine.translit_word(
+                        item["source"], lang_code=lang_code, topk=num_suggestions
+                    )
+            finally:
+                sync_slot.release()
+
+        return {
+            "output": data["input"],
+            # "status": {
+            #     "statusCode": 200,
+            #     "message" : "success"
+            # }
+        }, 200
+
+    finally:
+        logger.warning("%s released inference slot", uuid)
+        infer_slots.release()
